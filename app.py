@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, send_file, render_template_string, abort, jsonify
+from flask import Flask, request, send_file, render_template_string, abort, jsonify, make_response
 import tempfile, sys, subprocess
 from pathlib import Path
 from io import BytesIO
@@ -52,6 +52,20 @@ def on_404(e):
     # Return your normal 404 response (don’t leak ban info)
     return jsonify({"error": "Not Found"}), 404
 
+@app.route('/favicon.ico')
+@app.route('/apple-touch-icon-precomposed.png')
+@app.route('/apple-touch-icon.png')
+def favicon():
+    return '', 204
+
+@app.route("/robots.txt")
+def robots_txt():
+    body = "User-agent: *\nDisallow: /\n"
+    resp = make_response(body)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
 # --- Optional: admin helpers ---
 @app.get("/_banlist")
 def list_bans():
@@ -74,7 +88,7 @@ UPLOAD_FORM = """
 <html>
   <head>
     <meta charset="utf-8">
-    <title>ColdDial Formatter</title>
+    <title>CRM and ColdDial Formatter</title>
     <style>
       body { font-family: Arial, sans-serif; margin: 40px; color:#333; }
       .box { border: 2px dashed #aaa; padding: 24px; width: 520px; max-width: 90vw; text-align:center; }
@@ -85,7 +99,7 @@ UPLOAD_FORM = """
     </style>
   </head>
   <body>
-    <h2>Upload XLeads ZIP or CSV to convert to ColdDial</h2>
+    <h2>Upload XLeads file to convert to CRM or ColdDial</h2>
     <form method="post" enctype="multipart/form-data">
       <div class="box">
         <div class="row">
@@ -100,7 +114,9 @@ UPLOAD_FORM = """
             <option value="skip">Skip (may leave blanks)</option>
           </select>
         </div>
-        <button type="submit">Process</button>
+        <div>
+        <button type="submit" name="submit" value="xleads">Xleads</button>&nbsp;<button type="submit" name="submit" value="colddial">Colddial</button>
+        </div>
       </div>
     </form>
   </body>
@@ -123,29 +139,51 @@ def index():
     dnc_policy = request.form.get("dnc_policy", "include")
     if dnc_policy not in {"include", "fallback", "skip"}:
         dnc_policy = "include"
+    
+    target = request.form.get("submit", "colddial")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         src_path = tmpdir / uploaded.filename
         uploaded.save(src_path)
 
-        out_path = tmpdir / f"{src_path.stem}_mapped.csv"
+        if target == "xleads":
+            out_path = tmpdir / f"{src_path.stem}_xleads.csv"
+        else:
+            out_path = tmpdir / f"{src_path.stem}_colddial.csv"
 
         try:
             # Run colddial.py with the chosen DNC policy
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).parent / "colddial.py"),
-                    src_path.name,
-                    "--source-root", str(tmpdir),
-                    "--dest-root", str(tmpdir),
-                    "--dnc-policy", dnc_policy
-                ],
-                check=True,
-                capture_output=True,
-                text=True
-            )
+            if  target == "xleads":
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parent / "xleads_ghl.py"),
+                        src_path.name,
+                        "--source-root", str(tmpdir),
+                        "--dest-root", str(tmpdir),
+                        "--dnc-policy", dnc_policy
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                download_name = f"{src_path.stem}_xleads.csv"
+            else:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parent / "colddial.py"),
+                        src_path.name,
+                        "--source-root", str(tmpdir),
+                        "--dest-root", str(tmpdir),
+                        "--dnc-policy", dnc_policy
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                download_name = f"{src_path.stem}_colddial.csv"
         except subprocess.CalledProcessError as e:
             return f"<pre>Processing failed:\n\n{e.stderr or e.stdout}</pre>", 500
 
@@ -156,11 +194,11 @@ def index():
         data = out_path.read_bytes()
         mem = BytesIO(data)
         mem.seek(0)
-
+        
         return send_file(
             mem,
             as_attachment=True,
-            download_name=f"{src_path.stem}_mapped.csv",
+            download_name=download_name,
             mimetype="text/csv"
         )
 

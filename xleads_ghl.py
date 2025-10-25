@@ -1,36 +1,17 @@
-
 r"""
-colddial.py
+colddial.py (patched)
 
-- Default paths (Windows):
-    SOURCE_ROOT = r""
-    DEST_ROOT   = r""
-
-Usage:
-    python colddial.py <filename.csv|filename.zip> [--source-root "..."] [--dest-root "..."]
-                       [--no-overwrite] [--dnc-policy include|fallback|skip]
-
-Features:
-- Reads CSV or ZIP (auto-selects CSV inside).
-- Embedded schema; no template required.
-- Enforces destination column order from your template:
-  First Name, Last Name, Address, City, State, Zip Code, Phone #1, Phone #2, Phone #3, Email
-- Hard override mapping: Property* → Address/City/State/Zip Code; fallback to Mailing* if Property* missing.
-- Owner name = FirstName + LastName (case/underscore-insensitive). Used for name-similarity scoring.
-- Phone selection priority (max 3, deduped):
-  1) Mobile (C1 before C2 if tie)
-  2) Landline (C1 before C2)
-  3) VOIP (lowest)
-- **DNC policy (default = include):**
-    include  → treat DNC same as others (Litigator still skipped)
-    fallback → prefer non-DNC, but top-up with DNC if fewer than 3
-    skip     → skip all DNC (may leave blanks)
-- Prints sample name-similarity scores for first 5 rows.
+Changes:
+- Adds "Phone #1 Type", "Phone #2 Type", "Phone #3 Type" to DEST_HEADERS.
+- Reads phone type from the spreadsheet (the *_Type columns auto-detected in guess_phone_columns).
+- Uses type for ranking (mobile > landline > voip > unknown), as before.
+- Returns both numbers and their raw types from best_phone_triplet and writes them to output.
 """
 import argparse
 import re
 from typing import List, Dict, Tuple, Optional
 from difflib import SequenceMatcher
+import ghl_flat_mapper
 import pandas as pd
 from pathlib import Path
 import zipfile
@@ -47,8 +28,11 @@ DEST_HEADERS = [
     "State",
     "Zip Code",
     "Phone #1",
+    "Phone #1 Type",   # <-- NEW
     "Phone #2",
+    "Phone #2 Type",   # <-- NEW
     "Phone #3",
+    "Phone #3 Type",   # <-- NEW
     "Email",
 ]
 
@@ -94,7 +78,7 @@ def best_source_for(dest: str, src_cols: List[str]) -> Optional[str]:
             if syn_l in s.lower():
                 return s
 
-    if dest not in ["Phone #1", "Phone #2", "Phone #3"]:
+    if dest not in ["Phone #1", "Phone #2", "Phone #3", "Phone #1 Type", "Phone #2 Type", "Phone #3 Type"]:
         best, best_ratio = None, 0.0
         for s in src_cols:
             r = SequenceMatcher(None, _canon(dest), _canon(s)).ratio()
@@ -153,53 +137,46 @@ def guess_contact_name_cols(cols: List[str], which: int) -> List[str]:
             candidates.append(c)
     return candidates
 
+
 def guess_phone_columns(cols: List[str]) -> Tuple[List[str], Dict[str, Optional[str]], Dict[str, int], Dict[str, Optional[str]], Dict[str, Optional[str]]]:
-    phone_cols = []
+    """
+    Detect phone columns strictly matching the schema: Contact{N}Phone_{K}
+    and pair *_Type, *_DNC, *_Litigator columns (case-insensitive).
+    Returns:
+      phone_cols: list of phone number column names
+      type_for_phone: map phone_col -> its paired type column name (or None)
+      contact_rank: map phone_col -> 1 for Contact1, 2 for Contact2, else 3
+      dnc_for_phone: map phone_col -> its paired DNC column name (or None)
+      lit_for_phone: map phone_col -> its paired Litigator column name (or None)
+    """
+    phone_cols: List[str] = []
     type_for_phone: Dict[str, Optional[str]] = {}
     dnc_for_phone: Dict[str, Optional[str]] = {}
     lit_for_phone: Dict[str, Optional[str]] = {}
     contact_rank: Dict[str, int] = {}
 
-    can = _canon
+    # Build a case-insensitive lookup for exact column names
+    lower_to_actual = {c.lower(): c for c in cols}
+
+    # Regex for Contact{number}Phone_{index}
+    pat = re.compile(r'^contact(\d+)phone_(\d+)$', re.IGNORECASE)
+
     for c in cols:
-        n = can(c)
-        if "phone" in n or "mobile" in n or "cell" in n or "tel" in n:
-            phone_cols.append(c)
+        m = pat.match(c)
+        if not m:
+            continue
+        phone_cols.append(c)
 
-    canon_map = {can(c): c for c in cols}
+        contact_num = int(m.group(1))
+        contact_rank[c] = 1 if contact_num == 1 else (2 if contact_num == 2 else 3)
 
-    def pair_column(base_col: str, suffixes):
-        bcan = can(base_col)
-        for suf in suffixes:
-            guesses = [
-                f"{base_col}{suf}", f"{base_col} {suf}",
-                base_col.replace(" ", "_") + f"_{suf.lstrip('_')}",
-                base_col.replace("Phone", "Phone_") + suf,
-            ]
-            for g in guesses:
-                cc = can(g)
-                if cc in canon_map:
-                    return canon_map[cc]
-        for suf in suffixes:
-            cc = bcan + can(suf)
-            if cc in canon_map:
-                return canon_map[cc]
-        return None
+        base = c  # exact case
+        # Pair columns: *_Type, *_DNC, *_Litigator (same base with suffix)
+        for suffix, target_map in [('_type', type_for_phone), ('_dnc', dnc_for_phone), ('_litigator', lit_for_phone)]:
+            pair_key = (base + suffix).lower()
+            target_map[c] = lower_to_actual.get(pair_key)
 
-    for c in phone_cols:
-        type_for_phone[c] = pair_column(c, ["_Type", "Type"])
-        dnc_for_phone[c] = pair_column(c, ["_DNC", "DNC"])
-        lit_for_phone[c] = pair_column(c, ["_Litigator", "Litigator"])
-
-    for c in phone_cols:
-        n = can(c)
-        if "contact1" in n or "owner1" in n or re.search(r'\bc1\b', c.lower() or ""):
-            contact_rank[c] = 1
-        elif "contact2" in n or "owner2" in n or re.search(r'\bc2\b', c.lower() or ""):
-            contact_rank[c] = 2
-        else:
-            contact_rank[c] = 3
-
+    # Enforce PHONE_COL_MAX and stable order
     phone_cols = list(dict.fromkeys(phone_cols))[:PHONE_COL_MAX]
     return phone_cols, type_for_phone, contact_rank, dnc_for_phone, lit_for_phone
 
@@ -248,110 +225,113 @@ def find_owner_name_columns(src_cols: List[str]) -> Tuple[Optional[str], Optiona
                 last_col = c; break
     return first_col, last_col
 
-def best_phone_triplet(row: pd.Series,
-                       dnc_policy: str,
-                       phone_cols: List[str],
-                       type_for_phone: Dict[str, Optional[str]],
-                       contact_rank: Dict[str, int],
-                       owner_full: str,
-                       contact1_names: List[str],
-                       contact2_names: List[str],
-                       dnc_for_phone: Dict[str, Optional[str]],
-                       lit_for_phone: Dict[str, Optional[str]]) -> Tuple[str, str, str]:
-    candidates = []
-    dnc_candidates = []
+TYPE_SCORE = {
+    "mobile": 100, "cell": 100, "wireless": 100,
+    "residential": 70, "landline": 65,
+    "business": 60,
+    "voip": 55,
+    "unknown": 50,
+}
+
+def _is_trueish(v: str) -> bool:
+    return str(v).strip().lower() in ("true", "t", "1", "yes", "y")
+
+def best_phone_triplet(
+    row,
+    dnc_policy: str,                     # "include" (default), "skip", or "fallback"
+    phone_cols: List[str],
+    type_for_phone: Dict[str, Optional[str]],  # e.g. {"Contact1_Phone_1":"Contact1_Phone_1_Type", ...}
+    contact_rank: Dict[str, int],        # e.g. Contact1=1, Contact2=2, etc. per phone col
+    owner_full: str,
+    contact1_name_cols: List[str],
+    contact2_name_cols: List[str],
+    dnc_for_phone: Dict[str, Optional[str]],   # per-phone DNC flag column (optional)
+    lit_for_phone: Dict[str, Optional[str]],   # per-phone litigation flag column (optional)
+) -> Tuple[str, str, str, str, str, str]:
+    """
+    Returns six values in GROUPED order expected by your code:
+      [0]=Phone #1, [1]=Phone #2, [2]=Phone #3,
+      [3]=Phone #1 Type, [4]=Phone #2 Type, [5]=Phone #3 Type
+    """
+
+    def cat(cols: List[str]) -> str:
+        parts = []
+        for c in cols:
+            if c in row:
+                s = str(row[c]).strip()
+                if s:
+                    parts.append(s)
+        return " ".join(parts)
+
+    owner_l = (owner_full or "").strip().lower()
+    c1_l = cat(contact1_name_cols).lower()
+    c2_l = cat(contact2_name_cols).lower()
+
+    candidates = []  # (score, phone_pos, contact_pos, phone, raw_type, phone_col)
     seen = set()
 
-    def cat(row, cols: List[str]) -> str:
-        vals = [str(row[c]) for c in cols if c in row.index and pd.notna(row[c]) and str(row[c]).strip()]
-        return " ".join(vals).strip()
-
-    c1_full = cat(row, contact1_names)
-    c2_full = cat(row, contact2_names)
-
-    def name_sim(a: str, b: str) -> float:
-        if not a.strip() or not b.strip():
-            return 0.0
-        return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
     for col in phone_cols:
-        raw = row.get(col, None)
-        if pd.isna(raw) or not str(raw).strip():
+        raw = str(row.get(col, "")).strip()
+        phone = normalize_e164ish(raw)  # your helper
+        if not is_phone_like(phone):    # your helper
             continue
-        raw = str(raw).strip()
-        if not is_phone_like(raw):
-            continue
-        phone = normalize_e164ish(raw)
-        if not phone or phone in seen:
+        if phone in seen:
             continue
 
-        # DNC / Litigator
-        dnc_col = dnc_for_phone.get(col)
-        lit_col = lit_for_phone.get(col)
-        is_dnc = bool(dnc_col and dnc_col in row.index and is_truthy_flag(row.get(dnc_col)))
-        is_lit = bool(lit_col and lit_col in row.index and is_truthy_flag(row.get(lit_col)))
+        # sibling/type/dnc/lit columns (optional)
+        tcol = type_for_phone.get(col)
+        raw_type = str(row.get(tcol, "")).strip() if tcol else ""
+        kind = (raw_type or "").lower() or "unknown"
+
+        dcol = dnc_for_phone.get(col)
+        is_dnc = _is_trueish(row.get(dcol, "")) if dcol else False
+
+        lcol = lit_for_phone.get(col)
+        is_lit = _is_trueish(row.get(lcol, "")) if lcol else False
+
+        # hard-exclude litigators
         if is_lit:
-            continue  # always skip litigator
+            continue
+        # DNC policy
+        if dnc_policy == "skip" and is_dnc:
+            continue
 
-        # Kind
-        type_col = type_for_phone.get(col)
-        type_val = row.get(type_col) if type_col else None
-        kind = phone_kind_from_typeval(type_val)
-        if kind == "unknown" and is_mobile_colname(col):
-            kind = "mobile"  # column name hint
+        # score
+        score = TYPE_SCORE.get(kind, TYPE_SCORE["unknown"])
+        c_rank = contact_rank.get(col, 3)                # Contact1=1, Contact2=2, Contact3=3...
+        score += {1: 6, 2: 3, 3: 0}.get(c_rank, 0)
 
-        # Contact rank
-        c_rank = contact_rank.get(col, 3)
+        # light owner-name proximity nudge
+        if owner_l and c1_l and (owner_l in c1_l or c1_l in owner_l):
+            score += 2
+        if owner_l and c2_l and (owner_l in c2_l or c2_l in owner_l):
+            score += 1
 
-        # Name priority
-        priority = 0.0
-        if c_rank == 1:
-            priority = max(priority, name_sim(owner_full, c1_full))
-        elif c_rank == 2:
-            priority = max(priority, name_sim(owner_full, c2_full))
-        else:
-            priority = max(name_sim(owner_full, c1_full), name_sim(owner_full, c2_full))
+        # fallback policy keeps DNC but penalizes
+        if dnc_policy == "fallback" and is_dnc:
+            score -= 8
 
-        # Scoring
-        base = 0.0
-        if kind == "mobile":
-            base += 100
-        elif kind == "land":
-            base += 20
-        elif kind == "voip":
-            base += 10
-        else:
-            base += 15
+        # tie-breaker #1: prefer *_phone_1 over *_phone_2 over *_phone_3
+        m = re.search(r'phone[\s_]*(\d+)', col, re.I)
+        phone_pos = int(m.group(1)) if m else 99
 
-        if c_rank == 1:
-            base += 50
-        elif c_rank == 2:
-            base += 25
+        candidates.append((score, phone_pos, c_rank, phone, raw_type, col))
+        seen.add(phone)
 
-        base += 20.0 * priority
+    # sort: higher score first; then *_phone_1 before *_phone_2 before *_phone_3;
+    # then Contact1 before Contact2 before Contact3; then phone string for stability
+    candidates.sort(key=lambda t: (-t[0], t[1], t[2], t[3]))
 
-        target = candidates
-        if is_dnc and dnc_policy in ('skip','fallback'):
-            target = dnc_candidates if dnc_policy == 'fallback' else None
-        if is_dnc and dnc_policy == 'skip':
-            target = None
-        if target is not None:
-            target.append((base, phone, col))
-            seen.add(phone)
+    top = candidates[:3]
+    phones = [t[3] for t in top]
+    types  = [t[4] for t in top]
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    if dnc_policy == 'fallback' and len(candidates) < 3:
-        dnc_candidates.sort(key=lambda x: x[0], reverse=True)
-        for item in dnc_candidates:
-            if all(item[1] != c[1] for c in candidates):
-                candidates.append(item)
-                if len(candidates) >= 3:
-                    break
+    # pad to length 3 each
+    while len(phones) < 3: phones.append("")
+    while len(types)  < 3: types.append("")
 
-    phones = [c[1] for c in candidates[:3]]
-    while len(phones) < 3:
-        phones.append("")
-    return tuple(phones[:3])
+    # IMPORTANT: grouped order to match your downstream indexing
+    return phones[0], phones[1], phones[2], types[0], types[1], types[2]
 
 # ======================== MAIN ========================
 def main():
@@ -369,7 +349,7 @@ def main():
         raise FileNotFoundError(f"Source file not found: {source_path}")
 
     stem = Path(args.filename).stem
-    dest_path = Path(args.dest_root) / f"{stem}_colddial.csv"
+    dest_path = Path(args.dest_root) / f"{stem}_xleads.csv"
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     if args.no_overwrite and dest_path.exists():
         raise FileExistsError(f"Output exists and --no-overwrite specified: {dest_path}")
@@ -381,11 +361,12 @@ def main():
     owner_first_src, owner_last_src = find_owner_name_columns(src_cols)
 
     # Build output
-    out_df = pd.DataFrame(columns=DEST_HEADERS)
+    HEADERS = src_cols + DEST_HEADERS
+    out_df = src_df.copy()
 
     # Map non-phone fields
     for dest in DEST_HEADERS:
-        if dest in ["Phone #1", "Phone #2", "Phone #3"]:
+        if dest in ["Phone #1", "Phone #2", "Phone #3", "Phone #1 Type", "Phone #2 Type", "Phone #3 Type"]:
             continue
         src_match = best_source_for(dest, src_cols)
         out_df[dest] = src_df[src_match] if (src_match and src_match in src_df.columns) else ""
@@ -423,6 +404,8 @@ def main():
 
     # Phones with DNC policy handling and VOIP deprioritized
     phone_cols, type_for_phone, contact_rank, dnc_for_phone, lit_for_phone = guess_phone_columns(src_cols)
+    # Using explicit Contact{N}Phone_{K} schema; no further filtering needed.
+
     c1_name_cols = guess_contact_name_cols(src_cols, 1)
     c2_name_cols = guess_contact_name_cols(src_cols, 2)
 
@@ -433,18 +416,27 @@ def main():
 
     owner_full_series = src_df.apply(_owner_full_from_row, axis=1)
 
-    phones = src_df.apply(
+    phones_types = src_df.apply(
         lambda row: best_phone_triplet(row, args.dnc_policy, phone_cols, type_for_phone, contact_rank,
                                        owner_full_series.loc[row.name], c1_name_cols, c2_name_cols,
                                        dnc_for_phone, lit_for_phone),
         axis=1, result_type='expand'
     )
-    out_df["Phone #1"] = phones[0]
-    out_df["Phone #2"] = phones[1]
-    out_df["Phone #3"] = phones[2]
+    # phones_types columns: 0,1,2 = phones; 3,4,5 = raw types from sheet
+    out_df["Phone #1"] = phones_types[0]
+    out_df["Phone #1 Type"] = phones_types[3]
+    out_df["Phone #2"] = phones_types[1]
+    out_df["Phone #2 Type"] = phones_types[4]
+    out_df["Phone #3"] = phones_types[2]
+    out_df["Phone #3 Type"] = phones_types[5]
 
     # Enforce destination order and write
-    out_df = out_df.reindex(columns=DEST_HEADERS, fill_value="")
+    out_df = out_df.reindex(columns=HEADERS, fill_value="")
+    out_df = ghl_flat_mapper.map_source_to_destination(out_df)
+    if "MarketValue" in out_df.columns:
+        out_df = out_df.rename(columns={"MarketValue": "AVM"})
+    if "AssessedTotal" in out_df.columns:
+        out_df = out_df.drop(columns=["AssessedTotal"])
     out_df.to_csv(dest_path, index=False)
 
     # Debug prints
